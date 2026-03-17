@@ -511,6 +511,80 @@ async def resolve_forum_channel_from_link(guild: discord.Guild, tracking_link: s
     raise ValueError("Could not resolve a forum channel from tracking link")
 
 
+async def resolve_thread_from_link(guild: discord.Guild, thread_link: str) -> discord.Thread:
+    id_candidates = [int(value) for value in re.findall(r"(\d{15,22})", thread_link)]
+    if thread_link.strip().isdigit():
+        id_candidates = [int(thread_link.strip())]
+    if not id_candidates:
+        raise ValueError("Thread link does not contain a Discord thread ID")
+
+    for candidate in reversed(id_candidates):
+        channel = guild.get_channel(candidate)
+        if isinstance(channel, discord.Thread):
+            return channel
+
+        thread = guild.get_thread(candidate)
+        if isinstance(thread, discord.Thread):
+            return thread
+
+        try:
+            fetched = await guild.fetch_channel(candidate)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            continue
+
+        if isinstance(fetched, discord.Thread):
+            return fetched
+
+    raise ValueError("Could not resolve a thread from link")
+
+
+async def resolve_message_from_link(
+    guild: discord.Guild,
+    message_link: str,
+) -> tuple[discord.abc.GuildChannel | discord.Thread, discord.Message]:
+    parsed_link = parse_discord_message_link(message_link)
+    if parsed_link is None:
+        raise ValueError("Provide a valid Discord message link")
+
+    link_guild_id, channel_id, message_id = parsed_link
+    if guild.id != link_guild_id:
+        raise ValueError("Message link points to a different server")
+
+    target_channel = guild.get_channel(channel_id)
+    if target_channel is None:
+        maybe_thread = guild.get_thread(channel_id)
+        if isinstance(maybe_thread, discord.Thread):
+            target_channel = maybe_thread
+
+    if target_channel is None:
+        try:
+            fetched_channel = await guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+            raise ValueError("Could not access the linked channel or thread") from exc
+        if not isinstance(fetched_channel, discord.Thread | discord.abc.GuildChannel):
+            raise ValueError("Resolved link target is not a server channel or thread")
+        target_channel = fetched_channel
+
+    if not hasattr(target_channel, "fetch_message"):
+        raise ValueError("Resolved link target does not support message lookup")
+
+    try:
+        message = await target_channel.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+        raise ValueError("Could not fetch the linked message") from exc
+
+    return target_channel, message
+
+
+def summarize_message_text(value: str | None, *, max_length: int = 180) -> str:
+    normalized = re.sub(r"\s+", " ", (value or "").strip())
+    if not normalized:
+        return "(empty)"
+    if len(normalized) <= max_length:
+        return normalized
+    return f"{normalized[: max_length - 3]}..."
+
+
 async def count_forum_threads(forum_channel: discord.ForumChannel) -> int:
     active_count = len(forum_channel.threads)
     archived_count = 0
@@ -2386,6 +2460,69 @@ async def import_items(
     )
 
 
+@app_commands.command(name="message_link_inspect", description="Fetch a linked Discord message and report what the bot can read from it.")
+@app_commands.describe(link="Discord message link to inspect")
+async def message_link_inspect(interaction: discord.Interaction, link: str) -> None:
+    bot = interaction.client
+    assert isinstance(bot, PreyHerbTrackerBot)
+    if not await require_access(interaction, bot.database, "message_link_inspect"):
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(embed=clean_embed("Server Only", ["This command only works in a server."]), ephemeral=True)
+        return
+
+    try:
+        target_channel, message = await resolve_message_from_link(guild, link)
+    except ValueError as exc:
+        await interaction.response.send_message(embed=clean_embed("Inspect Failed", [str(exc)]), ephemeral=True)
+        return
+
+    await record_command_event(
+        interaction,
+        "message_link_inspect",
+        details={"link": link, "channel_id": target_channel.id, "message_id": message.id},
+    )
+
+    lines = [
+        f"Message ID: `{message.id}`.",
+        f"Channel: `{getattr(target_channel, 'name', 'unknown')}` (`{target_channel.id}` / `{type(target_channel).__name__}`).",
+        f"Author: `{message.author}` (`{message.author.id}`).",
+        f"Content chars: `{len(message.content or '')}`.",
+        f"Content preview: `{summarize_message_text(message.content)}`.",
+        f"Embeds: `{len(message.embeds)}`.",
+        f"Attachments: `{len(message.attachments)}`.",
+    ]
+    if isinstance(target_channel, discord.Thread) and target_channel.parent is not None:
+        lines.append(f"Parent channel: `{target_channel.parent.name}` (`{target_channel.parent.id}`).")
+    if message.embeds:
+        first_embed = message.embeds[0]
+        lines.append(f"First embed title: `{summarize_message_text(first_embed.title, max_length=120)}`.")
+        lines.append(f"First embed description: `{summarize_message_text(first_embed.description)}`.")
+
+    forum_entry = extract_forum_catalog_entry(message)
+    thread_entry = extract_thread_catalog_entry(message)
+    if forum_entry is not None:
+        lines.append(
+            "Forum parser: "
+            f"name=`{forum_entry['name']}` clan=`{forum_entry.get('clan') or 'none'}` "
+            f"territories=`{', '.join(forum_entry.get('territories', [])) or 'none'}` "
+            f"required_stat=`{forum_entry.get('required_stat') if forum_entry.get('required_stat') is not None else 'none'}`."
+        )
+    else:
+        lines.append("Forum parser: `no match`.")
+    if thread_entry is not None:
+        lines.append(
+            "Thread parser: "
+            f"name=`{thread_entry['name']}` "
+            f"required_stat=`{thread_entry.get('required_stat') if thread_entry.get('required_stat') is not None else 'none'}`."
+        )
+    else:
+        lines.append("Thread parser: `no match`.")
+
+    await interaction.response.send_message(embed=clean_embed("Message Link Inspect", lines), ephemeral=True)
+
+
 async def _import_forum_catalog_internal(
     interaction: discord.Interaction,
     forum_post_link: str,
@@ -3620,18 +3757,9 @@ async def _import_thread_catalog_internal(
         await interaction.response.send_message(embed=clean_embed("Server Only", ["This command only works in a server."]), ephemeral=True)
         return
 
-    thread_id_candidates = [int(value) for value in re.findall(r"(\d{15,22})", thread)]
-    if thread.strip().isdigit():
-        thread_id_candidates = [int(thread.strip())]
-
-    target_thread: discord.Thread | None = None
-    for candidate in thread_id_candidates:
-        maybe_thread = guild.get_thread(candidate)
-        if isinstance(maybe_thread, discord.Thread):
-            target_thread = maybe_thread
-            break
-
-    if target_thread is None:
+    try:
+        target_thread = await resolve_thread_from_link(guild, thread)
+    except ValueError:
         await interaction.response.send_message(
             embed=clean_embed(
                 "Thread Not Found",
@@ -4184,6 +4312,7 @@ async def preyherb_help(
         "linkage_show": "Show item–territory linkages grouped by category, territory, or clan/region.",
         "import_csv_examples": "Show example CSV formats for the import commands.",
         "import": "Unified import from csv/forum/thread; set confirm:False to preview without saving.",
+        "message_link_inspect": "Fetch a Discord message by link and show the raw content, embed preview, and parser matches.",
         "alert_config": "Configure low-storage alerts (channel and enabled flag).",
         "use_item": "Deduct an item from clan storage and trigger alert checks.",
         "char_stat_set": "Set character stat values used for item requirement checks.",
@@ -4255,6 +4384,7 @@ async def preyherb_help(
         "linkage_show": "/linkage_show view: name:",
         "import_csv_examples": "/import_csv_examples",
         "import": "/import type: link: category: stats: clan_region: confirm:",
+        "message_link_inspect": "/message_link_inspect link:",
         "alert_config": "/alert_config clan: enabled: alert_channel:",
         "use_item": "/use_item category: item_name: clan: amount:",
         "char_stat_set": "/char_stat_set stat_name: value: member:",
@@ -4326,6 +4456,7 @@ async def preyherb_help(
         "linkage_show",
         "import_csv_examples",
         "import",
+        "message_link_inspect",
         "alert_config",
         "use_item",
         "char_stat_set",
@@ -4436,6 +4567,7 @@ async def preyherb_help(
                 "system_check",
                 "import_csv_examples",
                 "import",
+                "message_link_inspect",
             ],
         ),
         (
@@ -4729,6 +4861,7 @@ def build_bot(settings):
         linkage_show,
         import_csv_examples,
         import_items,
+        message_link_inspect,
         alert_config,
         use_item,
         char_stat_set,

@@ -2467,6 +2467,7 @@ COMMAND_ACCESS = {
     "linkage_show": "user",
     "import_csv_examples": "mod",
     "import": "mod",
+    "message_link_inspect": "mod",
     "storage_show": "user",
     "roll": "user",
     "audit_log_show": "user",

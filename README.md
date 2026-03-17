@@ -163,3 +163,7 @@ Admins can create custom access tiers (for example: `healer`, `quartermaster`) a
 
 - test_seed_defaults and test_seed_demo seed default starter categories and items.
 - audit entries are retained for 31 days.
+
+## Legal
+
+- Terms of Service: TERMS_OF_SERVICE.md
