@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "preyherbtracker"
+version = "0.1.0"
+description = "Discord bot for clan prey and herb tracking"
+requires-python = ">=3.10"
+dependencies = [
+  "discord.py>=2.5,<3.0",
+  "python-dotenv>=1.0,<2.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

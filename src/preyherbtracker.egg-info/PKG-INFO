@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: preyherbtracker
+Version: 0.1.0
+Summary: Discord bot for clan prey and herb tracking
+Requires-Python: >=3.10
+Requires-Dist: discord.py<3.0,>=2.5
+Requires-Dist: python-dotenv<2.0,>=1.0
