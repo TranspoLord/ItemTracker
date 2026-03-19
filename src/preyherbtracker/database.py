@@ -31,6 +31,7 @@ class Database:
     def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
             connection.commit()
@@ -684,6 +685,22 @@ class Database:
                 (guild_id,),
             ).fetchall()
         return [self._row_to_clan(row) for row in rows]
+
+    def delete_clan(self, guild_id: int, name: str) -> None:
+        clan = self.require_clan(guild_id, name)
+        with self.connect() as connection:
+            connection.execute("DELETE FROM clans WHERE id = ?", (clan.id,))
+
+    def rename_clan(self, guild_id: int, old_name: str, new_name: str) -> Clan:
+        clan = self.require_clan(guild_id, old_name)
+        normalized_new = new_name.lower().strip()
+        if not normalized_new:
+            raise ValueError("New clan name cannot be empty.")
+        if self.get_clan(guild_id, normalized_new) is not None:
+            raise ValueError(f"A clan named '{normalized_new}' already exists.")
+        with self.connect() as connection:
+            connection.execute("UPDATE clans SET name = ? WHERE id = ?", (normalized_new, clan.id))
+        return self.require_clan(guild_id, normalized_new)
 
     def add_clan_member(self, guild_id: int, clan_name: str, user_id: int) -> None:
         clan = self.require_clan(guild_id, clan_name)
@@ -2422,7 +2439,7 @@ COMMAND_ACCESS = {
     "test_seed_demo": "admin",
     "clan_create": "admin",
     "clan_config": "admin",
-    "clan_set_cats": "mod",
+    "clan_delete": "admin",
     "clan_member_add": "mod",
     "clan_member_remove": "mod",
     "clan_member_show": "mod",
@@ -2460,21 +2477,20 @@ COMMAND_ACCESS = {
     "roll_config_show": "mod",
     "roll_config_set": "mod",
     "roll_config_reset": "mod",
-    "tracking_test_parse": "mod",
-    "tracking_sync_cats": "mod",
+    "preview_thread_link": "mod",
+    "preview_forum_count": "mod",
     "territory_link_validate": "mod",
     "system_check": "mod",
     "linkage_show": "user",
     "import_csv_examples": "mod",
     "import": "mod",
-    "message_link_inspect": "mod",
+    "preview_message_link": "mod",
     "storage_show": "user",
     "roll": "user",
     "audit_log_show": "user",
     "audit_undo_last": "user",
     "audit_export_json": "admin",
     "audit_clear": "admin",
-    "access_test_command": "admin",
     "dashboard_show": "user",
     "config_show": "user",
     "use_item": "user",

@@ -54,6 +54,17 @@ class _FakeGuild:
 
 
 class BotAppTests(unittest.IsolatedAsyncioTestCase):
+    def test_is_discord_tracking_link_accepts_discord_forms(self) -> None:
+        self.assertTrue(bot_app.is_discord_tracking_link("333333333333333333"))
+        self.assertTrue(
+            bot_app.is_discord_tracking_link(
+                "https://discord.com/channels/111111111111111111/222222222222222222/333333333333333333"
+            )
+        )
+
+    def test_is_discord_tracking_link_rejects_external_forum_urls(self) -> None:
+        self.assertFalse(bot_app.is_discord_tracking_link("https://forums.example.com/topic/cat-count-14"))
+
     async def test_resolve_thread_from_link_fetches_uncached_thread(self) -> None:
         forum = _FakeForumChannel()
         thread = _FakeThread(parent=forum)

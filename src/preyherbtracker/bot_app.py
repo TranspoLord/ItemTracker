@@ -396,6 +396,17 @@ def parse_discord_message_link(value: str) -> tuple[int, int, int] | None:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
+def is_discord_tracking_link(value: str) -> bool:
+    normalized = value.strip()
+    if normalized.isdigit():
+        return True
+    return re.search(
+        r"(?:https?://)?(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/\d{15,22}/\d{15,22}(?:/\d{15,22})?",
+        normalized,
+        re.IGNORECASE,
+    ) is not None
+
+
 def extract_forum_catalog_entry(message: discord.Message) -> dict[str, object] | None:
     content = (message.content or "").strip()
     embed_desc = ""
@@ -585,11 +596,31 @@ def summarize_message_text(value: str | None, *, max_length: int = 180) -> str:
     return f"{normalized[: max_length - 3]}..."
 
 
-async def count_forum_threads(forum_channel: discord.ForumChannel) -> int:
-    active_count = len(forum_channel.threads)
+async def count_forum_threads_breakdown(forum_channel: discord.ForumChannel) -> tuple[int, int, bool]:
+    active_thread_ids: set[int] = {
+        thread.id
+        for thread in forum_channel.threads
+        if thread.parent_id == forum_channel.id
+    }
+    try:
+        for thread in await forum_channel.guild.active_threads():
+            if thread.parent_id == forum_channel.id:
+                active_thread_ids.add(thread.id)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
     archived_count = 0
-    async for _thread in forum_channel.archived_threads(limit=None):
-        archived_count += 1
+    archived_complete = True
+    try:
+        async for _thread in forum_channel.archived_threads(limit=None):
+            archived_count += 1
+    except (discord.Forbidden, discord.HTTPException):
+        archived_complete = False
+    return len(active_thread_ids), archived_count, archived_complete
+
+
+async def count_forum_threads(forum_channel: discord.ForumChannel) -> int:
+    active_count, archived_count, _ = await count_forum_threads_breakdown(forum_channel)
     return active_count + archived_count
 
 
@@ -914,6 +945,15 @@ async def clan_create(
         return
     guild = interaction.guild
     assert guild is not None
+    if bot.database.get_clan(guild.id, name.lower().strip()) is not None:
+        await interaction.response.send_message(
+            embed=clean_embed("Clan Already Exists", [
+                f"A clan named `{name.lower().strip()}` already exists.",
+                "Use `/clan_config` to update it.",
+            ]),
+            ephemeral=True,
+        )
+        return
     await record_command_event(interaction, "clan_create", clan_name=name)
     clan = bot.database.create_clan(guild.id, name, tracking_mode=tracking_mode, tracking_link=tracking_link, cat_count=cat_count)
     await interaction.response.send_message(
@@ -943,9 +983,10 @@ async def clan_list(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=clean_embed("Clans", lines))
 
 
-@app_commands.command(name="clan_config", description="Update a clan's tracking and alert channel settings.")
+@app_commands.command(name="clan_config", description="Update a clan's tracking, alert, and name settings.")
 @app_commands.describe(
     clan="Clan to update",
+    new_name="Rename this clan; territory and storage data is preserved but commands must use the new name",
     tracking_mode="How the cat count is maintained",
     tracking_link="Forum channel/thread link or spreadsheet URL",
     cat_count="Current number of cats in this clan",
@@ -956,6 +997,7 @@ async def clan_list(interaction: discord.Interaction) -> None:
 async def clan_config(
     interaction: discord.Interaction,
     clan: str,
+    new_name: str | None = None,
     tracking_mode: TrackingLiteral | None = None,
     tracking_link: str | None = None,
     cat_count: app_commands.Range[int, 0, 500] | None = None,
@@ -969,52 +1011,105 @@ async def clan_config(
         return
     guild = interaction.guild
     assert guild is not None
+    old_name = clan.lower().strip()
+    name_changed = False
+    if new_name is not None and new_name.lower().strip() != old_name:
+        try:
+            bot.database.rename_clan(guild.id, clan, new_name)
+        except ValueError as exc:
+            await interaction.response.send_message(embed=clean_embed("Rename Failed", [str(exc)]), ephemeral=True)
+            return
+        clan = new_name.lower().strip()
+        name_changed = True
     await record_command_event(interaction, "clan_config", clan_name=clan)
-    updated = bot.database.update_clan_config(
-        guild.id,
-        clan,
-        tracking_mode=tracking_mode,
-        tracking_link=tracking_link,
-        cat_count=cat_count,
-        alerts_enabled=alerts_enabled,
-        alert_channel_id=alert_channel.id if alert_channel else None,
-        roll_log_channel_id=roll_log_channel.id if roll_log_channel else None,
-    )
-    await interaction.response.send_message(
-        embed=clean_embed(
-            "Clan Updated",
-            [
-                f"Name: `{updated.name}`.",
-                f"Tracking: `{updated.tracking_mode}`.",
-                f"Cats: `{updated.cat_count}`.",
-                f"Alerts enabled: `{updated.alerts_enabled}`.",
-                f"Roll log channel: `{updated.roll_log_channel_id or 'unset'}`.",
-            ],
+    try:
+        updated = bot.database.update_clan_config(
+            guild.id,
+            clan,
+            tracking_mode=tracking_mode,
+            tracking_link=tracking_link,
+            cat_count=cat_count,
+            alerts_enabled=alerts_enabled,
+            alert_channel_id=alert_channel.id if alert_channel else None,
+            roll_log_channel_id=roll_log_channel.id if roll_log_channel else None,
         )
-    )
+    except ValueError as exc:
+        await interaction.response.send_message(embed=clean_embed("Config Failed", [str(exc)]), ephemeral=True)
+        return
+    if updated.tracking_mode == "forum" and updated.tracking_link and (tracking_mode is not None or tracking_link is not None):
+        try:
+            _forum_ch = await resolve_forum_channel_from_link(guild, updated.tracking_link)
+            _new_count = await count_forum_threads(_forum_ch)
+            updated = bot.database.update_clan_config(guild.id, updated.name, cat_count=_new_count)
+        except Exception:
+            pass
+    lines = [
+        f"Name: `{updated.name}`.",
+        f"Tracking: `{updated.tracking_mode}`.",
+        f"Cats: `{updated.cat_count}`.",
+        f"Alerts enabled: `{updated.alerts_enabled}`.",
+        f"Roll log channel: `{updated.roll_log_channel_id or 'unset'}`.",
+    ]
+    if name_changed:
+        lines.append(
+            f":warning: Clan renamed from `{old_name}` to `{updated.name}`. "
+            "Storage, members, and territory data are preserved, but any territory links "
+            "owned by this clan will no longer auto-detect until territory names are checked. "
+            "All commands must now use the new name."
+        )
+    await interaction.response.send_message(embed=clean_embed("Clan Updated", lines))
 
 
-@app_commands.command(name="clan_set_cats", description="Set the current cat count for a clan.")
+@app_commands.command(name="clan_delete", description="Permanently delete a clan and all its storage, members, and territory links.")
 @app_commands.describe(
-    clan="Clan to update",
-    cat_count="Number of cats currently in this clan; used for dynamic alert thresholds",
+    clan="Clan to delete",
+    confirm="True to confirm deletion; False (default) previews what will be removed",
 )
-async def clan_set_cats(
+async def clan_delete(
     interaction: discord.Interaction,
     clan: str,
-    cat_count: app_commands.Range[int, 0, 500],
+    confirm: bool = False,
 ) -> None:
     bot = interaction.client
     assert isinstance(bot, PreyHerbTrackerBot)
-    if not await require_access(interaction, bot.database, "clan_set_cats"):
+    if not await require_access(interaction, bot.database, "clan_delete"):
         return
     guild = interaction.guild
     assert guild is not None
-    await record_command_event(interaction, "clan_set_cats", clan_name=clan)
-    updated = bot.database.update_clan_config(guild.id, clan, cat_count=cat_count)
-    await interaction.response.send_message(
-        embed=clean_embed("Cat Count Updated", [f"Clan `{updated.name}` now has `{updated.cat_count}` cats."])
-    )
+    try:
+        clan_obj = bot.database.require_clan(guild.id, clan)
+    except ValueError as exc:
+        await interaction.response.send_message(embed=clean_embed("Unknown Clan", [str(exc)]), ephemeral=True)
+        return
+
+    territory_names = bot.database.list_territory_names_by_clan(guild.id, clan_obj.name)
+    member_ids = bot.database.list_clan_members(guild.id, clan_obj.name)
+    storage_total = sum(bot.database.get_storage(guild.id, clan_obj.name).values())
+
+    if not confirm:
+        territory_preview = ", ".join(f"`{n}`" for n in territory_names[:5])
+        if len(territory_names) > 5:
+            territory_preview += f" … and {len(territory_names) - 5} more"
+        lines = [
+            f"Clan: `{clan_obj.name}`.",
+            ":warning: This will **permanently** delete all clan data and cannot be undone.",
+            f"Territories owned: `{len(territory_names)}`" + (f" — {territory_preview}" if territory_names else "") + ".",
+            f"Clan members linked: `{len(member_ids)}`.",
+            f"Total storage items: `{storage_total}`.",
+            "Re-run with `confirm: True` to confirm deletion.",
+        ]
+        await interaction.response.send_message(embed=clean_embed("Clan Delete Preview", lines), ephemeral=True)
+        return
+
+    await record_command_event(interaction, "clan_delete", clan_name=clan_obj.name)
+    bot.database.delete_clan(guild.id, clan_obj.name)
+    lines = [
+        f"Clan `{clan_obj.name}` has been permanently deleted.",
+        f"Territories removed: `{len(territory_names)}`.",
+        f"Members unlinked: `{len(member_ids)}`.",
+        f"Storage items removed: `{storage_total}`.",
+    ]
+    await interaction.response.send_message(embed=clean_embed("Clan Deleted", lines), ephemeral=True)
 
 
 @app_commands.command(name="clan_member_add", description="Assign a user to a clan for lower-tier storage access.")
@@ -1419,6 +1514,20 @@ async def item_add(
         return
     guild = interaction.guild
     assert guild is not None
+    try:
+        normalized_cat = bot.database.require_category(guild.id, category)
+    except ValueError as exc:
+        await interaction.response.send_message(embed=clean_embed("Unknown Category", [str(exc)]), ephemeral=True)
+        return
+    if bot.database.get_item(guild.id, normalized_cat, name.lower().strip()) is not None:
+        await interaction.response.send_message(
+            embed=clean_embed("Item Already Exists", [
+                f"`{name.lower().strip()}` already exists in category `{normalized_cat}`.",
+                "Use `/item_edit` to modify it.",
+            ]),
+            ephemeral=True,
+        )
+        return
     await record_command_event(interaction, "item_add")
     item = bot.database.add_item(
         guild.id,
@@ -2460,12 +2569,12 @@ async def import_items(
     )
 
 
-@app_commands.command(name="message_link_inspect", description="Fetch a linked Discord message and report what the bot can read from it.")
+@app_commands.command(name="preview_message_link", description="Fetch a linked Discord message and report what the bot can read from it.")
 @app_commands.describe(link="Discord message link to inspect")
-async def message_link_inspect(interaction: discord.Interaction, link: str) -> None:
+async def preview_message_link(interaction: discord.Interaction, link: str) -> None:
     bot = interaction.client
     assert isinstance(bot, PreyHerbTrackerBot)
-    if not await require_access(interaction, bot.database, "message_link_inspect"):
+    if not await require_access(interaction, bot.database, "preview_message_link"):
         return
     guild = interaction.guild
     if guild is None:
@@ -2480,7 +2589,7 @@ async def message_link_inspect(interaction: discord.Interaction, link: str) -> N
 
     await record_command_event(
         interaction,
-        "message_link_inspect",
+        "preview_message_link",
         details={"link": link, "channel_id": target_channel.id, "message_id": message.id},
     )
 
@@ -3122,100 +3231,152 @@ async def roll_config_reset(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=clean_embed("Roll Config Reset", lines))
 
 
-@app_commands.command(name="tracking_test_parse", description="Test parsing a cat count from forum or CSV text.")
-@app_commands.describe(
-    mode="Use forum for plain text samples, spreadsheet for CSV/Excel-exported CSV content",
-    sample_text="Paste sample forum text or CSV content to test parser behavior",
-)
-async def tracking_test_parse(
-    interaction: discord.Interaction,
-    mode: Literal["forum", "spreadsheet"],
-    sample_text: str,
-) -> None:
+@app_commands.command(name="preview_thread_link", description="Resolve a Discord thread link and report what the bot can read.")
+@app_commands.describe(link="Discord thread link or thread ID")
+async def preview_thread_link(interaction: discord.Interaction, link: str) -> None:
     bot = interaction.client
     assert isinstance(bot, PreyHerbTrackerBot)
-    if not await require_access(interaction, bot.database, "tracking_test_parse"):
-        return
-    try:
-        parsed = parse_tracking_cat_count(mode, sample_text)
-    except ValueError as error:
-        await interaction.response.send_message(embed=clean_embed("Tracking Parse Failed", [str(error)]), ephemeral=True)
-        return
-    await record_command_event(interaction, "tracking_test_parse", details={"mode": mode, "parsed_count": parsed})
-    await interaction.response.send_message(
-        embed=clean_embed(
-            "Tracking Parse Success",
-            [
-                f"Mode: `{mode}`.",
-                f"Parsed cat count: `{parsed}`.",
-            ],
-        ),
-        ephemeral=True,
-    )
-
-
-@app_commands.command(name="tracking_sync_cats", description="Fetch a clan's tracking source and sync its cat count.")
-@app_commands.describe(
-    clan="Clan to sync (uses its configured tracking mode and link)",
-)
-async def tracking_sync_cats(interaction: discord.Interaction, clan: str) -> None:
-    bot = interaction.client
-    assert isinstance(bot, PreyHerbTrackerBot)
-    if not await require_access(interaction, bot.database, "tracking_sync_cats"):
+    if not await require_access(interaction, bot.database, "preview_thread_link"):
         return
     guild = interaction.guild
-    assert guild is not None
-    clan_record = bot.database.require_clan(guild.id, clan)
+    if guild is None:
+        await interaction.response.send_message(embed=clean_embed("Server Only", ["This command only works in a server."]), ephemeral=True)
+        return
 
-    if clan_record.tracking_mode == TrackingMode.MANUAL.value or clan_record.tracking_mode == TrackingMode.OFF.value:
-        await interaction.response.send_message(
-            embed=clean_embed(
-                "Tracking Mode Not Syncable",
-                [
-                    f"`{clan_record.name}` uses `{clan_record.tracking_mode}` mode.",
-                    "Use `/clan_set_cats` manually or switch to forum/spreadsheet tracking mode.",
-                ],
-            ),
-            ephemeral=True,
-        )
-        return
-    if not clan_record.tracking_link:
-        await interaction.response.send_message(
-            embed=clean_embed("Missing Tracking Link", [f"Set a tracking link for `{clan_record.name}` first."]),
-            ephemeral=True,
-        )
-        return
     try:
-        parser_source = clan_record.tracking_link
-        if clan_record.tracking_mode == TrackingMode.FORUM.value:
-            forum_channel = await resolve_forum_channel_from_link(guild, clan_record.tracking_link)
-            parsed_count = await count_forum_threads(forum_channel)
-            parser_source = f"forum:{forum_channel.id}"
-        else:
-            raw_data = fetch_tracking_bytes(clan_record.tracking_link)
-            parsed_count = parse_tracking_cat_count_from_bytes(clan_record.tracking_mode, raw_data)
-    except Exception as error:
-        await interaction.response.send_message(
-            embed=clean_embed("Tracking Sync Failed", [str(error)]),
-            ephemeral=True,
-        )
+        thread = await resolve_thread_from_link(guild, link)
+    except ValueError as exc:
+        await interaction.response.send_message(embed=clean_embed("Inspect Failed", [str(exc)]), ephemeral=True)
         return
 
-    updated = bot.database.update_clan_config(guild.id, clan_record.name, cat_count=parsed_count)
     await record_command_event(
         interaction,
-        "tracking_sync_cats",
-        clan_name=clan_record.name,
-        details={"mode": clan_record.tracking_mode, "parsed_count": parsed_count, "source": parser_source},
+        "preview_thread_link",
+        details={"link": link, "thread_id": thread.id, "parent_id": thread.parent_id},
     )
+
     lines = [
-        f"Clan: `{updated.name}`.",
-        f"Mode: `{updated.tracking_mode}`.",
-        f"Cat count updated to: `{updated.cat_count}`.",
+        f"Thread: `{thread.name}` (`{thread.id}`).",
+        f"Parent: `{getattr(thread.parent, 'name', 'unknown')}` (`{thread.parent_id}`).",
+        f"Archived: `{thread.archived}`.",
+        f"Locked: `{thread.locked}`.",
+        f"Message count hint: `{thread.message_count if thread.message_count is not None else 'unknown'}`.",
     ]
-    if clan_record.tracking_mode == TrackingMode.FORUM.value:
-        lines.append("Source: Discord forum thread count (active + archived).")
-    await interaction.response.send_message(embed=clean_embed("Tracking Sync Complete", lines))
+
+    if isinstance(thread.parent, discord.ForumChannel):
+        try:
+            active_count, archived_count, archived_complete = await count_forum_threads_breakdown(thread.parent)
+            lines.append(f"Forum tracking active threads: `{active_count}`.")
+            if archived_complete:
+                lines.append(f"Forum tracking archived threads: `{archived_count}`.")
+            else:
+                lines.append("Forum tracking archived threads: `unavailable` (missing permission or API access).")
+            lines.append(f"Forum tracking total threads counted: `{active_count + archived_count}`.")
+        except Exception as exc:
+            lines.append(f"Forum tracking count failed: `{exc}`.")
+
+    starter_message = thread.starter_message
+    if starter_message is None:
+        try:
+            starter_message = await thread.fetch_message(thread.id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            starter_message = None
+
+    if starter_message is None:
+        lines.append("Starter message: `not accessible`.")
+        await interaction.response.send_message(embed=clean_embed("Thread Link Inspect", lines), ephemeral=True)
+        return
+
+    lines.append(f"Starter message ID: `{starter_message.id}`.")
+    lines.append(f"Starter preview: `{summarize_message_text(starter_message.content)}`.")
+    lines.append(f"Starter embeds: `{len(starter_message.embeds)}`.")
+
+    thread_entry = extract_thread_catalog_entry(starter_message)
+    if thread_entry is not None:
+        lines.append(
+            "Thread parser: "
+            f"name=`{thread_entry['name']}` "
+            f"required_stat=`{thread_entry.get('required_stat') if thread_entry.get('required_stat') is not None else 'none'}`."
+        )
+    else:
+        lines.append("Thread parser: `no match`.")
+
+    lines.append("Thread import parser expects first line format: `➺・item-name―+12` (stat is optional).")
+
+    found_items: list[dict[str, object]] = []
+    unmatched_samples: list[str] = []
+    try:
+        async for msg in thread.history(limit=20, oldest_first=True):
+            entry = extract_thread_catalog_entry(msg)
+            if entry is not None:
+                found_items.append(entry)
+                continue
+            raw_first_line = (msg.content or "").strip().splitlines()
+            if raw_first_line:
+                preview_line = summarize_message_text(raw_first_line[0], max_length=90)
+                if preview_line and len(unmatched_samples) < 3:
+                    unmatched_samples.append(preview_line)
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        lines.append(f"Item scan failed: `{exc}`.")
+    if found_items:
+        lines.append(f"Importable items found: `{len(found_items)}`.")
+        for item_entry in found_items[:5]:
+            stat_text = f" +{item_entry['required_stat']}" if item_entry.get("required_stat") is not None else ""
+            lines.append(f"  • `{item_entry['name']}`{stat_text}")
+        if len(found_items) > 5:
+            lines.append(f"  … and {len(found_items) - 5} more (scanned first 20 messages).")
+    else:
+        lines.append("Importable items: `none found`.")
+    if unmatched_samples:
+        lines.append("Examples that did not match thread import format:")
+        for sample in unmatched_samples:
+            lines.append(f"  • `{sample}`")
+
+    await interaction.response.send_message(embed=clean_embed("Thread Link Inspect", lines), ephemeral=True)
+
+
+@app_commands.command(name="preview_forum_count", description="Show exactly how many threads the bot can count in a forum.")
+@app_commands.describe(link="Discord forum link, thread link in that forum, or forum/thread ID")
+async def preview_forum_count(interaction: discord.Interaction, link: str) -> None:
+    bot = interaction.client
+    assert isinstance(bot, PreyHerbTrackerBot)
+    if not await require_access(interaction, bot.database, "preview_forum_count"):
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(embed=clean_embed("Server Only", ["This command only works in a server."]), ephemeral=True)
+        return
+
+    try:
+        forum_channel = await resolve_forum_channel_from_link(guild, link)
+    except ValueError as exc:
+        await interaction.response.send_message(embed=clean_embed("Preview Failed", [str(exc)]), ephemeral=True)
+        return
+
+    active_count, archived_count, archived_complete = await count_forum_threads_breakdown(forum_channel)
+    total_count = active_count + archived_count
+    await record_command_event(
+        interaction,
+        "preview_forum_count",
+        details={
+            "link": link,
+            "forum_id": forum_channel.id,
+            "active_count": active_count,
+            "archived_count": archived_count,
+            "archived_complete": archived_complete,
+            "total": total_count,
+        },
+    )
+
+    lines = [
+        f"Forum: `{forum_channel.name}` (`{forum_channel.id}`).",
+        f"Active threads counted: `{active_count}`.",
+        f"Archived threads counted: `{archived_count}`.",
+        f"Total counted threads: `{total_count}`.",
+    ]
+    if not archived_complete:
+        lines.append(":warning: Archived thread access is unavailable, so total may be lower than the real forum total.")
+    await interaction.response.send_message(embed=clean_embed("Forum Count Preview", lines), ephemeral=True)
 
 
 @app_commands.command(name="alert_config", description="Configure storage ratio alerts for a clan.")
@@ -4048,72 +4209,6 @@ async def audit_undo_last(interaction: discord.Interaction, clan: str) -> None:
     )
 
 
-@app_commands.command(name="access_test_command", description="Check whether a given access tier can run a command.")
-@app_commands.describe(
-    command_name="Bot command to simulate",
-    access_level="Access tier to test; leave blank to use your current effective tier",
-)
-async def access_test_command(
-    interaction: discord.Interaction,
-    command_name: str,
-    access_level: str | None = None,
-) -> None:
-    bot = interaction.client
-    assert isinstance(bot, PreyHerbTrackerBot)
-    if not await require_access(interaction, bot.database, "access_test_command"):
-        return
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message(embed=clean_embed("Server Only", ["This command only works in a server."]), ephemeral=True)
-        return
-
-    normalized_name = command_name.strip().lower()
-    if normalized_name not in COMMAND_ACCESS:
-        valid = ", ".join(sorted(COMMAND_ACCESS.keys()))
-        await interaction.response.send_message(
-            embed=clean_embed("Unknown Command", [f"`{normalized_name}` is not a valid command.", f"Valid commands: {valid}"]),
-            ephemeral=True,
-        )
-        return
-
-    levels = bot.database.get_access_level_ranks(guild.id)
-    if access_level is not None:
-        simulated_access = access_level.strip().lower()
-        if simulated_access not in levels:
-            await interaction.response.send_message(
-                embed=clean_embed("Unknown Access Level", [f"`{simulated_access}` is not defined in this server."]),
-                ephemeral=True,
-            )
-            return
-    else:
-        simulated_access = get_member_access_level(interaction, bot.database)
-    required_access = bot.database.get_command_access_level(guild.id, normalized_name, COMMAND_ACCESS)
-    default_access = COMMAND_ACCESS[normalized_name]
-    is_allowed = access_allows(bot.database, guild.id, simulated_access, required_access)
-
-    await record_command_event(
-        interaction,
-        "access_test_command",
-        details={"command_name": normalized_name, "simulated_access": simulated_access},
-    )
-
-    lines = [
-        f"Command: `/{normalized_name}`.",
-        f"Simulated access: `{simulated_access}`.",
-        f"Required access: `{required_access}`.",
-    ]
-    if required_access != default_access:
-        lines.append(f"Default access: `{default_access}`.")
-    if is_allowed:
-        lines.append("Result: allowed.")
-    else:
-        lines.append("Result: denied.")
-    await interaction.response.send_message(
-        embed=clean_embed("Access Test", lines),
-        ephemeral=True,
-    )
-
-
 @app_commands.command(name="dashboard_show", description="Show a clan or server-wide storage dashboard.")
 @app_commands.describe(
     clan="Optional clan to show in detail; leave blank for all clans",
@@ -4270,8 +4365,8 @@ async def preyherb_help(
         "test_seed_demo": "Seed defaults and create a demo clan in one step.",
         "clan_create": "Create a clan with tracking mode, cat count, and optional tracking link.",
         "clan_list": "List all clans with tracking mode and cat count.",
-        "clan_config": "Update a clan's tracking mode, cat count, and alert channel settings.",
-        "clan_set_cats": "Quickly update a clan's current cat count.",
+        "clan_config": "Update a clan's tracking mode, cat count, alert channel, and optionally rename it.",
+        "clan_delete": "Permanently delete a clan and cascade-remove all its storage, members, territory links, and history.",
         "clan_member_add": "Assign a user to a clan for lower-tier storage write access.",
         "clan_member_remove": "Remove a user from a clan assignment.",
         "clan_member_show": "List all users assigned to a clan.",
@@ -4305,14 +4400,14 @@ async def preyherb_help(
         "roll_config_show": "Show the current roll total bands and their find counts.",
         "roll_config_set": "Replace roll total bands with custom min–max:dose entries.",
         "roll_config_reset": "Reset roll total bands to built-in defaults.",
-        "tracking_test_parse": "Test the forum or CSV parser against sample text.",
-        "tracking_sync_cats": "Fetch the clan's tracking source and update its cat count.",
+        "preview_thread_link": "Resolve a Discord thread and show starter content plus parser output used by imports/tracking.",
+        "preview_forum_count": "Resolve a forum link/ID and show active, archived, and total thread counts the bot can access.",
         "territory_link_validate": "Check territory and category linkage coverage for gaps.",
         "system_check": "Run a broad health check across clans, territories, and linkages.",
         "linkage_show": "Show item–territory linkages grouped by category, territory, or clan/region.",
         "import_csv_examples": "Show example CSV formats for the import commands.",
         "import": "Unified import from csv/forum/thread; set confirm:False to preview without saving.",
-        "message_link_inspect": "Fetch a Discord message by link and show the raw content, embed preview, and parser matches.",
+        "preview_message_link": "Fetch a Discord message by link and show the raw content, embed preview, and parser matches.",
         "alert_config": "Configure low-storage alerts (channel and enabled flag).",
         "use_item": "Deduct an item from clan storage and trigger alert checks.",
         "char_stat_set": "Set character stat values used for item requirement checks.",
@@ -4321,7 +4416,6 @@ async def preyherb_help(
         "audit_undo_last": "Roll back the most recent eligible storage change for a clan.",
         "audit_export_json": "Download audit entries as JSON for a selected timeframe (up to 31 days).",
         "audit_clear": "Delete audit entries after explicit confirmation; supports clan/category/territory filters.",
-        "access_test_command": "Check whether a given access tier can run a command.",
         "dashboard_show": "Show a storage dashboard for one clan or all clans.",
         "impersonate_access": "Temporarily view the bot as a lower access tier.",
         "permission_set": "Map a Discord role or user to an access tier.",
@@ -4342,8 +4436,8 @@ async def preyherb_help(
         "test_seed_demo": "/test_seed_demo clan_name: tracking_mode: cat_count:",
         "clan_create": "/clan_create name: tracking_mode: tracking_link: cat_count:",
         "clan_list": "/clan_list",
-        "clan_config": "/clan_config clan: tracking_mode: tracking_link: cat_count: alerts_enabled: alert_channel: roll_log_channel:",
-        "clan_set_cats": "/clan_set_cats clan: cat_count:",
+        "clan_config": "/clan_config clan: new_name: tracking_mode: tracking_link: cat_count: alerts_enabled: alert_channel: roll_log_channel:",
+        "clan_delete": "/clan_delete clan: confirm:",
         "clan_member_add": "/clan_member_add clan: member:",
         "clan_member_remove": "/clan_member_remove clan: member:",
         "clan_member_show": "/clan_member_show clan:",
@@ -4377,14 +4471,14 @@ async def preyherb_help(
         "roll_config_show": "/roll_config_show",
         "roll_config_set": "/roll_config_set ranges:",
         "roll_config_reset": "/roll_config_reset",
-        "tracking_test_parse": "/tracking_test_parse mode: sample_text:",
-        "tracking_sync_cats": "/tracking_sync_cats clan:",
+        "preview_thread_link": "/preview_thread_link link:",
+        "preview_forum_count": "/preview_forum_count link:",
         "territory_link_validate": "/territory_link_validate scope:",
         "system_check": "/system_check",
         "linkage_show": "/linkage_show view: name:",
         "import_csv_examples": "/import_csv_examples",
         "import": "/import type: link: category: stats: clan_region: confirm:",
-        "message_link_inspect": "/message_link_inspect link:",
+        "preview_message_link": "/preview_message_link link:",
         "alert_config": "/alert_config clan: enabled: alert_channel:",
         "use_item": "/use_item category: item_name: clan: amount:",
         "char_stat_set": "/char_stat_set stat_name: value: member:",
@@ -4393,7 +4487,6 @@ async def preyherb_help(
         "audit_undo_last": "/audit_undo_last clan:",
         "audit_export_json": "/audit_export_json since_days: clan:",
         "audit_clear": "/audit_clear clan: category: territory: confirm:",
-        "access_test_command": "/access_test_command command_name: access_level:",
         "dashboard_show": "/dashboard_show clan:",
         "impersonate_access": "/impersonate_access access_level:",
         "permission_set": "/permission_set access_level: role: user:",
@@ -4415,7 +4508,7 @@ async def preyherb_help(
         "clan_create",
         "clan_list",
         "clan_config",
-        "clan_set_cats",
+        "clan_delete",
         "clan_member_add",
         "clan_member_remove",
         "clan_member_show",
@@ -4449,14 +4542,14 @@ async def preyherb_help(
         "roll_config_show",
         "roll_config_set",
         "roll_config_reset",
-        "tracking_test_parse",
-        "tracking_sync_cats",
+        "preview_thread_link",
+        "preview_forum_count",
         "territory_link_validate",
         "system_check",
         "linkage_show",
         "import_csv_examples",
         "import",
-        "message_link_inspect",
+        "preview_message_link",
         "alert_config",
         "use_item",
         "char_stat_set",
@@ -4465,7 +4558,6 @@ async def preyherb_help(
         "audit_undo_last",
         "audit_export_json",
         "audit_clear",
-        "access_test_command",
         "dashboard_show",
         "impersonate_access",
         "permission_set",
@@ -4490,7 +4582,6 @@ async def preyherb_help(
         "audit_log_show": "user",
         "audit_undo_last": "user",
         "audit_clear": "admin",
-        "access_test_command": "admin",
         "dashboard_show": "user",
         "impersonate_access": "mod",
         "quick_start": "user",
@@ -4505,7 +4596,7 @@ async def preyherb_help(
                 "clan_create",
                 "clan_list",
                 "clan_config",
-                "clan_set_cats",
+                "clan_delete",
                 "clan_member_add",
                 "clan_member_remove",
                 "clan_member_show",
@@ -4515,8 +4606,8 @@ async def preyherb_help(
                 "category_territory_rule_set",
                 "category_remove_request",
                 "category_remove_confirm",
-                "tracking_test_parse",
-                "tracking_sync_cats",
+                "preview_thread_link",
+                "preview_forum_count",
             ],
         ),
         (
@@ -4567,7 +4658,7 @@ async def preyherb_help(
                 "system_check",
                 "import_csv_examples",
                 "import",
-                "message_link_inspect",
+                "preview_message_link",
             ],
         ),
         (
@@ -4587,7 +4678,6 @@ async def preyherb_help(
                 "command_access_set",
                 "command_access_reset",
                 "command_access_show",
-                "access_test_command",
                 "impersonate_access",
                 "config_show",
             ],
@@ -4640,7 +4730,7 @@ async def preyherb_help(
 
 
 @clan_config.autocomplete("clan")
-@clan_set_cats.autocomplete("clan")
+@clan_delete.autocomplete("clan")
 @clan_member_add.autocomplete("clan")
 @clan_member_remove.autocomplete("clan")
 @clan_member_show.autocomplete("clan")
@@ -4659,7 +4749,6 @@ async def preyherb_help(
 @dashboard_show.autocomplete("clan")
 @config_show.autocomplete("clan")
 @use_item.autocomplete("clan")
-@tracking_sync_cats.autocomplete("clan")
 @clan_item_link.autocomplete("clan")
 @import_items.autocomplete("clan_region")
 @seasonal_modifier_set.autocomplete("clan")
@@ -4748,7 +4837,6 @@ async def item_name_ac(
 
 @command_access_set.autocomplete("command_name")
 @command_access_reset.autocomplete("command_name")
-@access_test_command.autocomplete("command_name")
 async def command_name_ac(
     interaction: discord.Interaction,
     current: str,
@@ -4758,7 +4846,6 @@ async def command_name_ac(
 
 @permission_set.autocomplete("access_level")
 @command_access_set.autocomplete("access_level")
-@access_test_command.autocomplete("access_level")
 @impersonate_access.autocomplete("access_level")
 @preyherb_help.autocomplete("access_level")
 async def access_level_ac(
@@ -4820,7 +4907,7 @@ def build_bot(settings):
         clan_create,
         clan_list,
         clan_config,
-        clan_set_cats,
+        clan_delete,
         clan_member_add,
         clan_member_remove,
         clan_member_show,
@@ -4854,14 +4941,14 @@ def build_bot(settings):
         roll_config_show,
         roll_config_set,
         roll_config_reset,
-        tracking_test_parse,
-        tracking_sync_cats,
+        preview_thread_link,
+        preview_forum_count,
         territory_link_validate,
         system_check,
         linkage_show,
         import_csv_examples,
         import_items,
-        message_link_inspect,
+        preview_message_link,
         alert_config,
         use_item,
         char_stat_set,
@@ -4870,7 +4957,6 @@ def build_bot(settings):
         audit_undo_last,
         audit_export_json,
         audit_clear,
-        access_test_command,
         dashboard_show,
         impersonate_access,
         permission_set,
